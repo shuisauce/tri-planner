@@ -176,6 +176,34 @@ export default function Planner(){
   };
 
   const clearPaint=()=>{setPaintHours(null);setPaintHosp(null);setCustomHours("")};
+
+  const clearMonth=(year,month)=>{
+    const mName=new Date(year,month).toLocaleDateString("en-US",{month:"long",year:"numeric"});
+    if(!confirm(`Clear all shifts for ${mName}? This cannot be undone.`))return;
+    setData(prev=>{
+      const u={...prev};const dim=new Date(year,month+1,0).getDate();
+      for(let i=1;i<=dim;i++){const k=ds(new Date(year,month,i));if(u[k])u[k]={...u[k],shift:null}}
+      return u;
+    });
+  };
+
+  const exportICal=()=>{
+    if(!data)return;
+    const lines=["BEGIN:VCALENDAR","VERSION:2.0","PRODID:-//KMS Anesthesia//Schedule Planner//EN","CALSCALE:GREGORIAN","METHOD:PUBLISH","X-WR-CALNAME:KMS Work Schedule"];
+    Object.keys(data).filter(k=>data[k].shift).sort().forEach(k=>{
+      const d=data[k];const dt=k.replace(/-/g,"");const h=d.shift.hours;
+      const endH=7+h;const endDay=endH>=24?addD(new Date(k+"T12:00:00"),1):null;
+      const endDt=endDay?ds(endDay).replace(/-/g,""):dt;const eH=endH>=24?endH-24:endH;
+      const hospFull=d.shift.hospital==="HFH"?"Henry Ford Health Providence":d.shift.hospital==="GR"?"Grand Rapids":"";
+      lines.push("BEGIN:VEVENT",`DTSTART:${dt}T070000`,`DTEND:${endDt}T${String(eH).padStart(2,"0")}0000`,
+        `SUMMARY:${h}h Shift${d.shift.hospital?" - "+d.shift.hospital:""}`,
+        hospFull?`LOCATION:${hospFull}`:"",`UID:${k}-shift@kms-planner`,
+        `DTSTAMP:${new Date().toISOString().replace(/[-:]/g,"").split(".")[0]}Z`,"END:VEVENT");
+    });
+    lines.push("END:VCALENDAR");
+    const blob=new Blob([lines.filter(Boolean).join("\r\n")],{type:"text/calendar"});
+    const url=URL.createObjectURL(blob);const a=document.createElement("a");a.href=url;a.download="kms-schedule.ics";a.click();URL.revokeObjectURL(url);
+  };
   const selectHours=h=>{setPaintHours(paintHours===h?null:h);setCustomHours("")};
   const applyCustom=()=>{const n=parseInt(customHours);if(n>0)setPaintHours(n)};
 
@@ -194,6 +222,7 @@ export default function Planner(){
           <button className="nbtn today" onClick={()=>{document.getElementById("month-now")?.scrollIntoView({behavior:"smooth",block:"start"})}}>Today</button>
           {showTraining&&<button className="nbtn" onClick={()=>setYmca(!ymca)}>🏊</button>}
           <button className="nbtn" onClick={exportWork}>📤 CSV</button>
+          <button className="nbtn" onClick={exportICal}>📅 iCal</button>
           <button className="nbtn" onClick={()=>{if(confirm("Reset all?"))setData(buildDefaults())}}>↺</button>
         </div>
       </div>
@@ -222,7 +251,7 @@ export default function Planner(){
 
         return(
           <div key={`${y}-${m}`} id={isNowMonth?"month-now":undefined}>
-            <div className="month-hdr">{mName}</div>
+            <div className="month-hdr"><span>{mName}</span>{(y>now.getFullYear()||(y===now.getFullYear()&&m>=now.getMonth()))&&<button onClick={()=>clearMonth(y,m)} style={{float:"right",background:"none",border:"1px solid #ddd",borderRadius:4,padding:"2px 8px",fontSize:10,color:"#999",cursor:"pointer",fontFamily:"'DM Sans',sans-serif"}}>🗑️ Clear shifts</button>}</div>
             {showTraining&&budgets.length>0&&(<div className="budget">{budgets.map((b,i)=>(<div key={i} className={`bwk ${b.isCur?"cur":""}`}><span className="bwk-label">Wk {b.label}</span>{Object.entries(TYPES).map(([k,mt])=>(<span key={k} className={`bpill ${b[k]>=2?"ok":""}`} style={{color:mt.color}}>{mt.icon}{b[k]}/2</span>))}</div>))}</div>)}
             <div className="ghd">{["Mon","Tue","Wed","Thu","Fri","Sat","Sun"].map(d=><div key={d} className="ghd-c">{d}</div>)}</div>
             <div className="grid">
