@@ -96,8 +96,10 @@ function buildDefaults(){
   return d;
 }
 
+const DEFAULT_SETTINGS = { annualGoal: 285000, rates: { HFH: 233, GR: 250 } };
+
 function lsLoad(){try{const r=localStorage.getItem(LS_KEY);return r?JSON.parse(r):null}catch{return null}}
-function lsSave(d,s,tr){try{localStorage.setItem(LS_KEY,JSON.stringify({d,s,tr}))}catch{}}
+function lsSave(d,s,tr,cfg){try{localStorage.setItem(LS_KEY,JSON.stringify({d,s,tr,cfg}))}catch{}}
 
 function getMonthRange(){
   const now=new Date();const start={y:now.getFullYear(),m:now.getMonth()};const months=[];
@@ -116,6 +118,9 @@ export default function Planner(){
   const[ok,setOk]=useState(false);
   const[showTraining,setShowTraining]=useState(true);
   const[syncStatus,setSyncStatus]=useState("loading");
+  const[settings,setSettings]=useState(DEFAULT_SETTINGS);
+  const[showDash,setShowDash]=useState(false);
+  const[showSettings,setShowSettings]=useState(false);
   const[paintHours,setPaintHours]=useState(null);
   const[paintHosp,setPaintHosp]=useState(null);
   const[customHours,setCustomHours]=useState("");
@@ -126,9 +131,9 @@ export default function Planner(){
       let loaded=false;
       try{
         const remote=await loadPlanner();
-        if(remote?.schedule){setData(migrateData(remote.schedule));if(remote.swim_hours)setSwim(remote.swim_hours);setSyncStatus("synced");loaded=true;}
+        if(remote?.schedule){setData(migrateData(remote.schedule));if(remote.swim_hours)setSwim(remote.swim_hours);if(remote.settings)setSettings({...DEFAULT_SETTINGS,...remote.settings});setSyncStatus("synced");loaded=true;}
       }catch(e){console.warn("Supabase load failed",e)}
-      if(!loaded){const local=lsLoad();if(local?.d){setData(migrateData(local.d));if(local.s)setSwim(local.s);if(local.tr!==undefined)setShowTraining(local.tr);setSyncStatus("local");loaded=true;}}
+      if(!loaded){const local=lsLoad();if(local?.d){setData(migrateData(local.d));if(local.s)setSwim(local.s);if(local.tr!==undefined)setShowTraining(local.tr);if(local.cfg)setSettings({...DEFAULT_SETTINGS,...local.cfg});setSyncStatus("local");loaded=true;}}
       if(!loaded){setData(buildDefaults());setSyncStatus("local")}
       setOk(true);
     })();
@@ -138,10 +143,10 @@ export default function Planner(){
   useEffect(()=>{
     if(!ok||!data)return;clearTimeout(sRef.current);
     sRef.current=setTimeout(async()=>{
-      lsSave(data,swim,showTraining);
+      lsSave(data,swim,showTraining,settings);
       try{const success=await savePlanner(data,swim);setSyncStatus(success?"synced":"local")}catch{setSyncStatus("local")}
     },800);
-  },[data,swim,ok,showTraining]);
+  },[data,swim,ok,showTraining,settings]);
 
   const now=new Date();now.setHours(0,0,0,0);const nowKey=ds(now);const wLeft=weeksTo(RACE_DAY,now);const months=getMonthRange();
   const gd=k=>data?.[k]||{shift:null,workouts:[],vacation:false,events:[]};
@@ -207,6 +212,60 @@ export default function Planner(){
   const selectHours=h=>{setPaintHours(paintHours===h?null:h);setCustomHours("")};
   const applyCustom=()=>{const n=parseInt(customHours);if(n>0)setPaintHours(n)};
 
+  // ── Dashboard Computation ──
+  const dash = (() => {
+    if (!data) return null;
+    const yr = now.getFullYear();
+    const yearStart = new Date(yr, 0, 1);
+    const totalWeeksInYear = 52.14;
+    const weeksElapsed = Math.max(0.01, (now - yearStart) / (7 * 864e5));
+    const weeksRemaining = Math.max(0.01, totalWeeksInYear - weeksElapsed);
+    const goal = settings.annualGoal || 285000;
+
+    let ytdHours = 0, ytdGross = 0, futureHours = 0, futureGross = 0;
+    let ytdShifts = 0, futureShifts = 0, pastVacDays = 0, futureVacDays = 0;
+
+    for (const [k, day] of Object.entries(data)) {
+      const dt = new Date(k + "T12:00:00");
+      if (dt.getFullYear() !== yr) continue;
+      const isPast = dt <= now;
+      if (day.vacation) { if (isPast) pastVacDays++; else futureVacDays++; }
+      if (day.shift) {
+        const h = day.shift.hours;
+        const rate = settings.rates?.[day.shift.hospital] || settings.rates?.HFH || 233;
+        const income = h * rate;
+        if (isPast) { ytdHours += h; ytdGross += income; ytdShifts++; }
+        else { futureHours += h; futureGross += income; futureShifts++; }
+      }
+    }
+
+    const pastVacWeeks = Math.round(pastVacDays / 7 * 10) / 10;
+    const futureVacWeeks = Math.round(futureVacDays / 7 * 10) / 10;
+    const totalVacWeeks = pastVacWeeks + futureVacWeeks;
+
+    // Vacation-adjusted weeks
+    const workedWeeks = Math.max(0.01, weeksElapsed - pastVacWeeks);
+    const futureWorkingWeeks = Math.max(0.01, weeksRemaining - futureVacWeeks);
+    const totalWorkingWeeks = totalWeeksInYear - totalVacWeeks;
+
+    // Pace target adjusted for vacation (goal spread across working weeks only)
+    const whereIShouldBe = goal * (workedWeeks / totalWorkingWeeks);
+    const aheadBehind = ytdGross - whereIShouldBe;
+
+    // Pace projection: earning rate per worked week × remaining working weeks
+    const earningRate = ytdGross / workedWeeks;
+    const paceProjection = ytdGross + (earningRate * futureWorkingWeeks);
+
+    const schedProjection = ytdGross + futureGross;
+    const incomeGap = Math.max(0, goal - schedProjection);
+    const avgWeeklyHours = ytdHours / workedWeeks;
+    const avgWeeklyIncome = ytdGross / workedWeeks;
+    const utilization = (avgWeeklyHours / 40) * 100;
+    const neededWeeklyIncome = futureWorkingWeeks > 0 ? Math.max(0, goal - ytdGross - futureGross) / futureWorkingWeeks : 0;
+
+    return { ytdHours, ytdGross, futureHours, futureGross, futureShifts, whereIShouldBe, aheadBehind, paceProjection, schedProjection, incomeGap, avgWeeklyHours, avgWeeklyIncome, utilization, weeksElapsed: Math.round(weeksElapsed*10)/10, weeksRemaining: Math.round(weeksRemaining*10)/10, ytdShifts, goal, neededWeeklyIncome, pastVacWeeks, futureVacWeeks, totalVacWeeks, futureWorkingWeeks: Math.round(futureWorkingWeeks*10)/10 };
+  })();
+
   if(!ok)return(<div style={{display:"flex",alignItems:"center",justifyContent:"center",height:"100vh"}}><div style={{textAlign:"center",color:"#999",fontSize:13}}>Loading...</div></div>);
 
   return(
@@ -219,6 +278,8 @@ export default function Planner(){
           {syncStatus==="local"&&<span className="sync-err">● local only</span>}
         </div>
         <div className="hdr-btns">
+          <button className={`nbtn ${showDash?"today":""}`} onClick={()=>{setShowDash(!showDash);setShowSettings(false)}}>📊 Dash</button>
+          <button className="nbtn" onClick={()=>{setShowSettings(!showSettings);setShowDash(false)}}>⚙️</button>
           <button className="nbtn today" onClick={()=>{document.getElementById("month-now")?.scrollIntoView({behavior:"smooth",block:"start"})}}>Today</button>
           {showTraining&&<button className="nbtn" onClick={()=>setYmca(!ymca)}>🏊</button>}
           <button className="nbtn" onClick={exportWork}>📤 CSV</button>
@@ -243,6 +304,71 @@ export default function Planner(){
         {paintActive?(<><div className="tb-active"><span className="paint-dot"/>Paint: {paintHours}h @ {paintHosp}</div><button className="tb-clear" onClick={clearPaint}>Clear</button></>):(<span style={{fontSize:10,color:"#bbb"}}>Select shift + site to paint</span>)}
         <button className={`tb-toggle ${showTraining?"on":"off"}`} onClick={()=>setShowTraining(!showTraining)}>🏋️ Training {showTraining?"ON":"OFF"}</button>
       </div>
+
+      {/* Dashboard */}
+      {showDash && dash && (
+        <div className="dash-panel">
+          <div className="dash-grid">
+            <div className="dash-card">
+              <div className="dash-label">YTD Gross</div>
+              <div className="dash-value">${dash.ytdGross.toLocaleString()}</div>
+              <div className="dash-sub">{dash.ytdShifts} shifts · {Math.round(dash.ytdHours)}h · {dash.weeksElapsed}wk elapsed</div>
+            </div>
+            <div className={`dash-card ${dash.aheadBehind>=0?"dash-good":"dash-bad"}`}>
+              <div className="dash-label">vs Pace Target</div>
+              <div className="dash-value">{dash.aheadBehind>=0?"+":""}${Math.round(dash.aheadBehind).toLocaleString()}</div>
+              <div className="dash-sub">{dash.aheadBehind>=0?"Ahead":"Behind"} · should be ${Math.round(dash.whereIShouldBe).toLocaleString()}</div>
+            </div>
+            <div className="dash-card">
+              <div className="dash-label">Pace Projection (EOY)</div>
+              <div className="dash-value">${Math.round(dash.paceProjection).toLocaleString()}</div>
+              <div className="dash-sub">{dash.paceProjection>=dash.goal?"✅ On track":"⚠️ Below goal"} · adjusted for {dash.totalVacWeeks}wk vacation</div>
+            </div>
+            <div className="dash-card">
+              <div className="dash-label">Scheduled Projection</div>
+              <div className="dash-value">${Math.round(dash.schedProjection).toLocaleString()}</div>
+              <div className="dash-sub">{dash.futureShifts} future shifts · {Math.round(dash.futureHours)}h booked</div>
+            </div>
+            <div className={`dash-card ${dash.incomeGap>0?"dash-warn":"dash-good"}`}>
+              <div className="dash-label">Income Gap</div>
+              <div className="dash-value">{dash.incomeGap>0?"$"+Math.round(dash.incomeGap).toLocaleString():"$0 ✅"}</div>
+              <div className="dash-sub">{dash.incomeGap>0?`Need $${Math.round(dash.neededWeeklyIncome).toLocaleString()}/wk × ${dash.futureWorkingWeeks} working wks`:"Fully booked to goal"}</div>
+            </div>
+            <div className="dash-card">
+              <div className="dash-label">Weekly Averages</div>
+              <div className="dash-value">{Math.round(dash.avgWeeklyHours)}h / ${Math.round(dash.avgWeeklyIncome).toLocaleString()}</div>
+              <div className="dash-sub">{Math.round(dash.utilization)}% utilization · Vacation: {dash.totalVacWeeks}wk ({dash.futureVacWeeks} future)</div>
+            </div>
+          </div>
+          <div style={{padding:"0 16px 8px",display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+            <div style={{height:6,flex:1,background:"#e4e4de",borderRadius:3,marginRight:12,overflow:"hidden"}}>
+              <div style={{height:"100%",width:`${Math.min(100,Math.round(dash.ytdGross/dash.goal*100))}%`,background:dash.ytdGross/dash.goal>=dash.weeksElapsed/52.14?"#22c55e":"#f59e0b",borderRadius:3,transition:"width .3s"}}/>
+            </div>
+            <span style={{fontSize:11,fontWeight:600,fontFamily:"'JetBrains Mono',monospace",color:"#666"}}>{Math.round(dash.ytdGross/dash.goal*100)}% of goal</span>
+          </div>
+        </div>
+      )}
+
+      {/* Settings Panel */}
+      {showSettings && (
+        <div className="settings-panel">
+          <div style={{padding:"12px 16px",display:"flex",flexWrap:"wrap",gap:16,alignItems:"flex-end"}}>
+            <div>
+              <label className="dash-label" style={{display:"block",marginBottom:4}}>Annual Goal ($)</label>
+              <input type="number" className="tb-other" style={{width:100}} value={settings.annualGoal}
+                onChange={e=>setSettings(s=>({...s,annualGoal:parseInt(e.target.value)||0}))}/>
+            </div>
+            {HOSPITALS.map(h=>(
+              <div key={h}>
+                <label className="dash-label" style={{display:"block",marginBottom:4}}>{h} Rate ($/hr)</label>
+                <input type="number" className="tb-other" style={{width:80}} value={settings.rates?.[h]||0}
+                  onChange={e=>setSettings(s=>({...s,rates:{...s.rates,[h]:parseInt(e.target.value)||0}}))}/>
+              </div>
+            ))}
+            <button className="nbtn" style={{color:"#111",border:"1px solid #ddd",fontSize:11,padding:"4px 10px"}} onClick={()=>setShowSettings(false)}>Done</button>
+          </div>
+        </div>
+      )}
 
       {months.map(({y,m})=>{
         const cells=getMonthGrid(y,m);const mName=new Date(y,m).toLocaleDateString("en-US",{month:"long",year:"numeric"});
